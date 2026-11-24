@@ -1,0 +1,87 @@
+name: servicepulse
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-api-environment: &api-environment
+  NODE_ENV: production
+  DATABASE_TYPE: mongodb
+  MONGODB_URI: ${MONGODB_URI:?MONGODB_URI must be set}
+  MONGODB_DB: ${MONGODB_DB:-servicePulse}
+  PORT: 4000
+  WEB_ORIGIN: ${WEB_ORIGIN}
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  RUN_WORKERS_IN_API: "false"
+  PROBE_LOCATION: ${PROBE_LOCATION:-AWS EC2}
+
+services:
+  api:
+    image: ${API_IMAGE:?API_IMAGE must be set}
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    environment: *api-environment
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: ${API_IMAGE:?API_IMAGE must be set}
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["node", "dist/worker.js"]
+    env_file: .env
+    environment: *api-environment
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "dist/worker-health.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    stop_grace_period: 40s
+
+  web:
+    image: ${WEB_IMAGE:?WEB_IMAGE must be set}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:4000/api
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      CADDY_SITE: ${CADDY_SITE:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

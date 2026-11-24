@@ -1,0 +1,202 @@
+name: Build Private GHCR Images & Deploy to AWS
+
+on:
+  push:
+    branches:
+      - development
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target AWS environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event.inputs.environment || 'auto' }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-env:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.set-env.outputs.env }}
+      owner: ${{ steps.set-env.outputs.owner }}
+    steps:
+      - id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "env=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_name }}" = "main" ]; then
+            echo "env=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+          fi
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  deploy:
+    needs: [resolve-env, checks]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.env }}
+    env:
+      TARGET_ENV: ${{ needs.resolve-env.outputs.env }}
+      GHCR_OWNER: ${{ needs.resolve-env.outputs.owner }}
+      IMAGE_TAG: ${{ github.sha }}
+      AWS_REGION: ap-southeast-2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push private API image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/servicepulse-${{ env.TARGET_ENV }}-api:${{ env.IMAGE_TAG }}
+            ghcr.io/${{ env.GHCR_OWNER }}/servicepulse-${{ env.TARGET_ENV }}-api:latest
+          cache-from: type=gha,scope=api-${{ env.TARGET_ENV }}
+          cache-to: type=gha,mode=max,scope=api-${{ env.TARGET_ENV }}
+
+      - name: Build and push private Web image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/servicepulse-${{ env.TARGET_ENV }}-web:${{ env.IMAGE_TAG }}
+            ghcr.io/${{ env.GHCR_OWNER }}/servicepulse-${{ env.TARGET_ENV }}-web:latest
+          cache-from: type=gha,scope=web-${{ env.TARGET_ENV }}
+          cache-to: type=gha,mode=max,scope=web-${{ env.TARGET_ENV }}
+
+      - name: Deploy containers to AWS EC2 via SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PULL_TOKEN || secrets.GITHUB_TOKEN }}
+          APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ vars.MONGODB_DB || 'servicePulse' }}
+          ADMIN_INITIAL_EMAIL: ${{ secrets.ADMIN_INITIAL_EMAIL }}
+          ADMIN_INITIAL_PASSWORD: ${{ secrets.ADMIN_INITIAL_PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALLOWED_TARGET_DOMAINS: ${{ vars.ALLOWED_TARGET_DOMAINS || 'miraqlabs.com' }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          cat << 'EOF' > ~/.ssh/deploy_key
+          ${{ secrets.EC2_SSH_KEY }}
+          EOF
+          chmod 600 ~/.ssh/deploy_key
+
+          # Test if the key is valid OpenSSH key
+          ssh-keygen -l -f ~/.ssh/deploy_key || { echo "Invalid SSH Private Key in EC2_SSH_KEY secret"; exit 1; }
+
+          SSH_OPTS="-i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          # Configure HTTPS automatically when Hostinger subdomain (APP_DOMAIN) is set
+          if [ -n "${APP_DOMAIN:-}" ]; then
+            CADDY_SITE="$APP_DOMAIN"
+            WEB_ORIGIN="https://${APP_DOMAIN}"
+            COOKIE_SECURE="true"
+          else
+            CADDY_SITE=":80"
+            WEB_ORIGIN="http://${EC2_HOST}"
+            COOKIE_SECURE="false"
+          fi
+
+          # Generate .env file locally (keeps MongoDB Atlas URI & secrets out of Git)
+          cat > /tmp/servicepulse.env <<EOF
+          NODE_ENV=production
+          DATABASE_TYPE=mongodb
+          MONGODB_URI=${MONGODB_URI}
+          MONGODB_DB=${MONGODB_DB}
+          CADDY_SITE=${CADDY_SITE}
+          WEB_ORIGIN=${WEB_ORIGIN}
+          COOKIE_SECURE=${COOKIE_SECURE}
+          PROBE_LOCATION=AWS EC2 (${TARGET_ENV})
+          ALLOWED_TARGET_DOMAINS=${ALLOWED_TARGET_DOMAINS}
+          ADMIN_INITIAL_EMAIL=${ADMIN_INITIAL_EMAIL:-admin@miraqlabs.com}
+          ADMIN_INITIAL_PASSWORD=${ADMIN_INITIAL_PASSWORD:-AdminPass123!}
+          GEMINI_API_KEY=${GEMINI_API_KEY:-}
+          API_IMAGE=ghcr.io/${GHCR_OWNER}/servicepulse-${TARGET_ENV}-api:${IMAGE_TAG}
+          WEB_IMAGE=ghcr.io/${GHCR_OWNER}/servicepulse-${TARGET_ENV}-web:${IMAGE_TAG}
+          EOF
+
+          # Wait briefly if EC2 user_data is still finishing Docker installation
+          ssh $SSH_OPTS ubuntu@"$EC2_HOST" "
+            for i in \$(seq 1 30); do
+              if command -v docker >/dev/null 2>&1 && [ -d /opt/servicepulse ]; then
+                exit 0
+              fi
+              echo 'Waiting for EC2 bootstrap (Docker)...'
+              sleep 10
+            done
+            echo 'Timed out waiting for EC2 bootstrap.'
+            exit 1
+          "
+
+          scp $SSH_OPTS docker-compose.aws.yml ubuntu@"$EC2_HOST":/opt/servicepulse/docker-compose.aws.yml
+          scp $SSH_OPTS Caddyfile ubuntu@"$EC2_HOST":/opt/servicepulse/Caddyfile
+          scp $SSH_OPTS /tmp/servicepulse.env ubuntu@"$EC2_HOST":/opt/servicepulse/.env
+          rm -f /tmp/servicepulse.env
+
+          # Login to private GHCR securely over stdin, pull images, restart stack, and logout
+          printf '%s' "$GHCR_TOKEN" | ssh $SSH_OPTS ubuntu@"$EC2_HOST" "
+            set -euo pipefail
+            cd /opt/servicepulse
+            chmod 600 .env
+            docker login ghcr.io -u '${GHCR_USER}' --password-stdin
+            docker compose -f docker-compose.aws.yml pull
+            docker compose -f docker-compose.aws.yml up -d --remove-orphans
+            docker logout ghcr.io
+            docker image prune -f
+
+            for i in \$(seq 1 20); do
+              if curl -fsS http://127.0.0.1:4000/api/health/ready >/dev/null 2>&1; then
+                echo 'ServicePulse API is healthy!'
+                docker compose -f docker-compose.aws.yml ps
+                exit 0
+              fi
+              sleep 3
+            done
+            echo 'Health check failed. Recent logs:'
+            docker compose -f docker-compose.aws.yml logs --tail=50
+            exit 1
+          "

@@ -1,0 +1,49 @@
+name: ServicePulse CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - development
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: docker build -f apps/api/Dockerfile -t servicepulse-api:${{ github.sha }} .
+      - run: docker build -f apps/web/Dockerfile -t servicepulse-web:${{ github.sha }} .
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra/terraform
+      - name: Validate dev environment
+        working-directory: infra/terraform/environments/dev
+        run: |
+          terraform init -backend=false
+          terraform validate
+      - name: Validate prod environment
+        working-directory: infra/terraform/environments/prod
+        run: |
+          terraform init -backend=false
+          terraform validate
